@@ -23,7 +23,7 @@ def start_training(exp_name = 'MaskRcnn', device='mps', data_path='/Users/dragos
   # define training and validation data loaders
   train_dataloader = torch.utils.data.DataLoader(
       subset,
-      batch_size=1,
+      batch_size=4,
       shuffle=True,
       collate_fn=utils.collate_fn
   )
@@ -37,38 +37,38 @@ def start_training(exp_name = 'MaskRcnn', device='mps', data_path='/Users/dragos
 
   model = utils.get_model_instance_segmentation(num_classes)
   model.to(device)
-  epochs=100
+  epochs=15
   # lr = 5e-4
-  optimizer = torch.optim.AdamW(model.parameters(), lr=1e-6)  # start low
-  lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-      optimizer,
-      max_lr=5e-4,  # your peak
-      steps_per_epoch=len(train_dataloader),
-      epochs=epochs,
-      pct_start=0.1,  # warmup
-      div_factor=100,  # initial lr = max_lr/div_factor
-      final_div_factor=100  # end small
-  )
+  # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-6)  # start low
+  # lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+  #     optimizer,
+  #     max_lr=5e-4,  # your peak
+  #     steps_per_epoch=len(train_dataloader),
+  #     epochs=epochs,
+  #     pct_start=0.1,  # warmup
+  #     div_factor=100,  # initial lr = max_lr/div_factor
+  #     final_div_factor=100  # end small
+  # )
   # optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
   # lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, 
   #                                                   max_lr=lr, 
   #                                                   total_steps=epochs*len(train_dataloader))
 
   # construct an optimizer
-  # params = [p for p in model.parameters() if p.requires_grad]
-  # optimizer = torch.optim.SGD(
-  #     params,
-  #     lr=0.005,
-  #     momentum=0.9,
-  #     weight_decay=0.0005
-  # )
+  params = [p for p in model.parameters() if p.requires_grad]
+  optimizer = torch.optim.SGD(
+      params,
+      lr=0.005,
+      momentum=0.9,
+      weight_decay=0.0005
+  )
 
-  # # and a learning rate scheduler
-  # lr_scheduler = torch.optim.lr_scheduler.StepLR(
-  #     optimizer,
-  #     step_size=3,
-  #     gamma=0.1
-  # )
+  # and a learning rate scheduler
+  lr_scheduler = torch.optim.lr_scheduler.StepLR(
+      optimizer,
+      step_size=3,
+      gamma=0.1
+  )
 
   utils.train_loop(model=model, 
             train_dataloader=train_dataloader,

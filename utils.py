@@ -46,7 +46,7 @@ def move_data_to_device(data, # Data to move to the device.
         return data
 
 def get_model_instance_segmentation(num_classes):
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights='DEFAULT')
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn_v2(weights='DEFAULT')
 
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
@@ -60,32 +60,7 @@ def get_model_instance_segmentation(num_classes):
         hidden_layer,
         num_classes
     )
-
-    sizes = (
-    (16,),  # P2
-    (32,),  # P3
-    (64,),  # P4
-    (128,), # P5
-    (256,)  # P6
-    )
-
-    aspect_ratios = (
-        (0.5, 1.0, 2.0),  # P2
-        (0.5, 1.0, 2.0),  # P3
-        (0.5, 1.0, 2.0),  # P4
-        (0.5, 1.0, 2.0),  # P5
-        (0.5, 1.0, 2.0)   # P6
-    )
-
-    anchor_generator = AnchorGenerator(sizes=sizes, aspect_ratios=aspect_ratios)
-
-    model.rpn.anchor_generator = anchor_generator
-
-    model.roi_heads.mask_roi_pool = torchvision.ops.MultiScaleRoIAlign(
-        featmap_names=['0', '1', '2', '3'],
-        output_size=28,   # try 28 or even 56
-        sampling_ratio=2
-    )
+    model.roi_heads.mask_loss_weight = 5.0  # Increase mask loss importance
 
     return model
 
@@ -97,6 +72,28 @@ def denormalize(tensor, mean, std):
     std = torch.tensor(std).view(-1, 1, 1).to(tensor.device)
     return (tensor * std + mean).clamp(0, 1)
 
+
+def plot_ultra_prediction(image, boxes, masks):
+  if 'scores' in outputs:
+    score_mask = outputs['scores'] > 0.5
+    outputs = {
+        'masks': outputs['masks'][score_mask],
+        'boxes': outputs['boxes'][score_mask],
+        'labels': outputs['labels'][score_mask]
+    }
+  classes = ['dent', 'scratch', 'crack', 'glass_shatter', 'lamp_broken', 'tire_flat']
+  mean = [0.485, 0.456, 0.406]
+  std = [0.229, 0.224, 0.225]
+  image_tensor = denormalize(images[0], mean, std)
+
+  masks = outputs['masks'] > 0  # Convert masks to boolean
+  image_with_masks = draw_segmentation_masks(image_tensor, masks.squeeze(1), colors="pink", alpha=0.7)
+
+  boxes = outputs['boxes']
+  labels = [classes[int(label)] for label in outputs['labels']]
+  image_with_boxes = draw_bounding_boxes(image_with_masks, boxes, colors="red", labels=labels, width=2)
+
+  return image_with_boxes
 
 def plot_prediction(images, outputs):
   outputs = outputs[0]
@@ -121,59 +118,65 @@ def plot_prediction(images, outputs):
 
   return image_with_boxes
 
-def run_train_epoch(model, dataloader, optimizer, lr_scheduler, device, scaler, epoch_id, writer, plot_step=5):
+def run_train_epoch(model, dataloader, optimizer, lr_scheduler, device, scaler, epoch_id, writer, plot_step=1):
     model.train()
     
     epoch_loss = 0
+
+    lr_scheduler = None
+    if epoch_id == 0:
+        warmup_factor = 1.0 / 1000
+        warmup_iters = min(1000, len(dataloader) - 1)
+
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=warmup_factor, total_iters=warmup_iters
+        )
     
     for batch_id, (images, targets) in enumerate(dataloader):
-        images = torch.stack(images).to(device)
-        # Forward pass with Automatic Mixed Precision (AMP) context manager
-        # with autocast(torch.device(device)):
-        img = images[0]
-        losses = model(images.to(device), move_data_to_device(targets, device))
-        # print("Loss dict", losses)
-        # loss = sum([loss for loss in losses.values()]) 
-        loss = (
-            1.0 * losses['loss_classifier'] +
-            1.0 * losses['loss_box_reg'] +
-            10.0 * losses['loss_mask'] +
-            1.0 * losses['loss_objectness'] +
-            1.0 * losses['loss_rpn_box_reg']
-        )
-        if scaler:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            old_scaler = scaler.get_scale()
-            scaler.update()
-            new_scaler = scaler.get_scale()
-            if new_scaler >= old_scaler:
-                lr_scheduler.step()
-        else:
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-        
-        optimizer.zero_grad()
+      images = list(image.to(device) for image in images)
+      targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+      # Forward pass with Automatic Mixed Precision (AMP) context manager
+      with torch.cuda.amp.autocast(enabled=scaler is not None):
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+        # losses = (
+        #     1.0 * loss_dict['loss_classifier'] +
+        #     1.0 * loss_dict['loss_box_reg'] +
+        #     3.0 * loss_dict['loss_mask'] +
+        #     1.0 * loss_dict['loss_objectness'] +
+        #     1.0 * loss_dict['loss_rpn_box_reg']
+        # )
 
-        loss_item = loss.item()
-        epoch_loss += loss_item
-        
-        if batch_id % plot_step == 0:
-          print(f"Batch {batch_id}/{len(dataloader)}")
-          print('Loss:  ', loss_item, '   Avg loss:  ', epoch_loss/(batch_id+1))
-          print(losses)
-          writer.add_scalar('Train/Loss', loss_item, epoch_id*len(dataloader) + batch_id)
-          writer.add_scalar('Train/Avg_Loss', epoch_loss/(batch_id+1), epoch_id*len(dataloader) + batch_id)
-          if batch_id % plot_step == 0:
-            model.eval()
-            with torch.no_grad():
-              outputs = model(images.to(device))
-            gt_plot = plot_prediction(images, targets)
-            pred_plot = plot_prediction(images, outputs)
-            writer.add_image('Train_samples/Ground_truth', gt_plot, epoch_id*len(dataloader) + batch_id)
-            writer.add_image('Train_samples/Prediction', pred_plot, epoch_id*len(dataloader) + batch_id)
-            model.train()
+      optimizer.zero_grad()
+      if scaler is not None:
+          scaler.scale(losses).backward()
+          scaler.step(optimizer)
+          scaler.update()
+      else:
+          losses.backward()
+          optimizer.step()
+
+      if lr_scheduler is not None:
+          lr_scheduler.step()
+
+      loss_item = losses.item()
+      epoch_loss += loss_item
+      
+      if batch_id % plot_step == 0:
+        print(f"Batch {batch_id}/{len(dataloader)}")
+        print('Loss:  ', loss_item, '   Avg loss:  ', epoch_loss/(batch_id+1))
+        print(loss_dict)
+        writer.add_scalar('Train/Loss', loss_item, epoch_id*len(dataloader) + batch_id)
+        writer.add_scalar('Train/Avg_Loss', epoch_loss/(batch_id+1), epoch_id*len(dataloader) + batch_id)
+        # if batch_id % plot_step == 0:
+        #   model.eval()
+        #   with torch.no_grad():
+        #     outputs = model(images)
+        #   gt_plot = plot_prediction(images, targets)
+        #   pred_plot = plot_prediction(images, outputs)
+        #   writer.add_image('Train_samples/Ground_truth', gt_plot, epoch_id*len(dataloader) + batch_id)
+        #   writer.add_image('Train_samples/Prediction', pred_plot, epoch_id*len(dataloader) + batch_id)
+        #   model.train()
 
         # If loss is NaN or infinity, stop training
         stop_training_message = f"Loss is NaN or infinite at epoch {epoch_id}, batch {batch_id}. Stopping training."
@@ -182,40 +185,24 @@ def run_train_epoch(model, dataloader, optimizer, lr_scheduler, device, scaler, 
     return epoch_loss / (batch_id + 1)
 
 
-def run_val_epoch(model, dataloader, optimizer, lr_scheduler, device, scaler, epoch_id, writer, plot_step=1):
+def run_val_epoch(model, dataloader, device, epoch_id, writer, plot_step=9):
     model.eval()
     
     epoch_loss = 0
     
     for batch_id, (images, targets) in enumerate(dataloader):
-        images = torch.stack(images).to(device)
-        # Forward pass with Automatic Mixed Precision (AMP) context manager
-        # with autocast(torch.device(device).type):
-        with torch.no_grad():
-          losses = model(images.to(device), move_data_to_device(targets, device))
-          loss = sum([loss for loss in losses.values()]) 
-
-        loss_item = loss.item()
-        epoch_loss += loss_item
+      images = list(image.to(device) for image in images)
+      targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+      
+      outputs = model(images)
         
-        if batch_id % plot_step == 0:
-          print(f"Batch {batch_id}/{len(dataloader)}")
-          print('Loss:  ', loss_item, '   Avg loss:  ', epoch_loss/(batch_id+1))
-          writer.add_scalar('Valid/Loss', loss_item, epoch_id*len(dataloader) + batch_id)
-          writer.add_scalar('Valid/Avg_Loss', epoch_loss/(batch_id+1), epoch_id*len(dataloader) + batch_id)
-          if batch_id % plot_step == 0:
-            with torch.no_grad():
-                outputs = model(images.to(device))
-            gt_plot = plot_prediction(images, targets)
-            pred_plot = plot_prediction(images, outputs)
-            writer.add_image('Valid_samples/Ground_truth', gt_plot, epoch_id*len(dataloader) + batch_id)
-            writer.add_image('Valid_samples/Prediction', pred_plot, epoch_id*len(dataloader) + batch_id)
+      if batch_id % plot_step == 0:
+          gt_plot = plot_prediction(images, targets)
+          pred_plot = plot_prediction(images, outputs)
+          writer.add_image('Valid_samples/Ground_truth', gt_plot, epoch_id*len(dataloader) + batch_id)
+          writer.add_image('Valid_samples/Prediction', pred_plot, epoch_id*len(dataloader) + batch_id)
 
-        # If loss is NaN or infinity, stop training
-        stop_training_message = f"Loss is NaN or infinite at epoch {epoch_id}, batch {batch_id}. Stopping training."
-        assert not math.isnan(loss_item) and math.isfinite(loss_item), stop_training_message
-
-    return epoch_loss / (batch_id + 1)
+    return epoch_loss
 
 
 def train_loop(model, 
@@ -238,8 +225,8 @@ def train_loop(model,
         print(f"Epoch {epoch}/{epochs}")
         train_loss = run_train_epoch(model, train_dataloader, optimizer, lr_scheduler, device, scaler, epoch, writer)
   
-        # with torch.no_grad():
-        #     valid_loss = run_val_epoch(model, valid_dataloader, None, None, device, scaler, epoch, writer)
+        with torch.no_grad():
+            valid_loss = run_val_epoch(model, valid_dataloader, device, epoch, writer)
 
         # if valid_loss < best_loss:
         #     best_loss = valid_loss
